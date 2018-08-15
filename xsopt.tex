@@ -1,0 +1,340 @@
+\documentclass[mathserif,hyperref={urlcolor=cyan,colorlinks=true}]{beamer}
+\usepackage[utf8]{inputenc}
+
+\usetheme{Warsaw}
+
+\usepackage[T1]{fontenc}
+\usepackage{multicol}
+
+\usepackage{minted}
+\usemintedstyle{monokai}
+
+\newminted{bash}{fontsize=\fontsize{7}{7}}
+\newminted{c}{fontsize=\fontsize{7}{7}}
+\newminted{diff}{fontsize=\fontsize{7}{7}}
+\newminted{perl}{fontsize=\fontsize{7}{7}}
+\newminted{console}{fontsize=\fontsize{7}{7}}
+\definecolor{bgc}{HTML}{272822}
+
+\beamertemplatenavigationsymbolsempty
+\setbeamertemplate{headline}{}
+\setbeamertemplate{footline}{}
+
+\title{Writing Efficient XS}
+\author{Sergey Aleynikov}
+\date[August 2018]{YAPC::EU 2018}
+
+\begin{document}{
+
+\begin{frame}
+\titlepage
+\end{frame}
+
+{
+\color{white}
+\setbeamercolor{background canvas}{bg=bgc}
+\setbeamercolor{item}{fg=white}
+\setbeamercolor{itemize/enumerate body}{fg=white}
+
+\begin{frame}[fragile]
+\center{Optimizing?}
+\begin{itemize}
+\pause
+\item Profiling
+\pause
+\item Profiling
+\pause
+\item Algorithm choice
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+\center{
+    perf top
+}
+\begin{itemize}
+\item hv{\_}common
+\item sv{\_}setsv{\_}flags
+\item pp{\_}method{\_}named
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{itemize}
+\item gv{\_}init{\_}{\**}
+\item gv{\_}stash{\_}{\**}
+\item gv{\_}fetchmeth{\_}{\**}
+\item hv{\_}fetch{\_}{\**}
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{bashcode}
+time perl -e '$a{foooooooooo}++ for (1..1_000_000)'
+time perl -e 'my $x = "foooooooooo"; $a{$x}++ for (1..1_000_000)'
+time perl -e '$a{foooooooooo}=1; my ($x) = keys %a; $a{$x}++ for (1..1_000_000)'
+\end{bashcode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+Foo*
+Foo::new ()
+CODE:
+    RETVAL = new Foo();
+OUTPUT:
+    RETVAL
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+XS_EUPXS(XS_Foo_new)
+{
+    char *  CLASS = (char *)SvPV_nolen(ST(0));
+    Foo *   RETVAL;;
+    RETVAL = new Foo();
+    {
+        SV * RETVALSV;
+        RETVALSV = sv_newmortal();
+        sv_setref_pv( RETVALSV, CLASS, (void*)RETVAL );
+        ST(0) = RETVALSV;
+    }
+    }
+    XSRETURN(1);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+static SV* foo_key;
+
+BOOT:
+{
+    foo_key = newSVpvn_share("fooooooo", strlen("fooooooo"), 0);
+}
+\end{ccode}
+\pause
+\begin{ccode}
+# Not thread safe - needs CLONE section
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+while ((entry = hv_iternext(hv))) {
+    char* key = HeKEY(entry);
+    if (strEQ(key, "magic_value") {...}
+}
+\end{ccode}
+\pause
+{$\Downarrow$}
+\begin{ccode}
+while ((entry = hv_iternext(hv))) {
+    if (HeKEY(entry) == magic_value_sv) {...}
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+hv_store_ent(hash, keysv, newSV(), 0);
+\end{ccode}
+\pause
+{$\Downarrow$} 
+\begin{ccode}
+hv_store_ent(hash, keysv, &PL_sv_undef, 0);
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+while (HE* he = hv_iternext(hv)) {
+    SV* key_sv = hv_iterkeysv(he);
+    int keyval = SvUV(key_sv);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{perlcode}
+my $bar = exists $foo{bar} ? $foo{bar} : ($foo{bar} = 42);
+\end{perlcode}
+\pause
+\begin{ccode}
+HE* he = hv_fetch_ent(hash, key_sv, 1, 0);
+if (SvOK(HeVAL(he)) {
+    HeVAL(he) = newSViv(42);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{perlcode}
+my $bar = exists $foo{bar} ? $foo{bar} : ($foo{bar} = 42);
+\end{perlcode}
+\begin{ccode}
+HE* he = hv_fetch_ent(hash, key_sv, 1, 0);
+if (SvOK(HeVAL(he)) {
+    SvREFCNT_dec(HeVAL(he));
+    HeVAL(he) = newSViv(42);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{perlcode}
+my $bar = exists $foo{bar} ? $foo{bar} : ($foo{bar} = 42);
+\end{perlcode}
+\begin{ccode}
+HE* he = hv_common(hash, key_sv, NULL, 0, 0,
+    HV_FETCH_EMPTY_HE | HV_FETCH_LVALUE, NULL, 0);
+if (!HeVAL(he)) {
+    HeVAL(he) = newSViv(42);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+void
+oldfoo (SV* self, SV* arg) {
+    ...; // do stuff
+}
+
+void
+foo (SV* self, SV* arg) {
+    PUSHMARK(SP); 
+    XPUSHs(self);
+    XPUSHs(arg);
+    PUTBACK; ENTER; SAVETMPS;
+    call_method("oldfoo", G_DISCARD);
+    FREETMPS; LEAVE;
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+void
+oldfoo (SV* self, SV* arg) {
+    ...; // do stuff
+}
+
+void
+foo (SV* self, SV* arg) {
+    PUSHMARK(SP);
+    EXTEND(SP, 2);
+    PUSHs(self);
+    PUSHs(arg);
+    PUTBACK; ENTER; SAVETMPS;
+    call_method("oldfoo", G_SCALAR);
+    SPAGAIN; POPs; PUTBACK;
+    FREETMPS; LEAVE;
+    // new stuff
+}
+\end{ccode}
+\pause
+{$\Downarrow$}
+\begin{ccode}
+void
+oldfoo (SV* self, SV* arg) {
+    oldfoo(self, arg);
+}
+void
+foo (SV* self, SV* arg) {
+    oldfoo(self, arg);
+    newstuff();
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+for (int i = 0; i < items; ++i) {
+    process(ST(i));
+}
+\end{ccode}
+\pause
+{$\Downarrow$}
+\begin{ccode}
+for (int i = 0; i < items; ++i) {
+    process(++SP);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+class Foo {SV* val;};
+
+void
+Foo::bar(SV* arg) {
+    THIS->val(arg);
+}
+\end{ccode}
+\pause
+{$\Downarrow$}
+\begin{ccode}
+void
+Foo::bar(SV* arg) {
+    sv_setsv(THIS->val, arg);
+}
+\end{ccode}
+\pause
+{$\Downarrow$}
+\begin{ccode}
+void
+Foo::bar(SV* arg) {
+    THIS->val(arg);
+    SvREFCNT_inc_simple_NN(arg);
+}
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+    size_t len = AvFILL(av);
+    for (size_t i = 0; i<= len; ++i) {
+        SV* elem = *av_fetch(av);
+        ...;
+    }
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\begin{ccode}
+    size_t len = AvFILL(av);
+    SV** elems = AvARRAY(av);
+    for (size_t i = 0; i<= len; ++i) {
+        SV* elem = *(elems++);
+        ...;
+    }
+\end{ccode}
+\end{frame}
+
+\begin{frame}[fragile]
+\center{
+    General directions
+}
+\begin{itemize}
+\item<1->Avoid tie()
+\item<2->Avoid overload
+\item<3->Look at opcodes for simple subs
+\end{itemize}
+\end{frame}
+
+\begin{frame}
+\center{
+    Questions?\\
+    \vspace{2ex}
+    \href{https://codeandtalk.com/v/yapc-na-2016/2016-writing-xs-in-plain-c-bulk-88}{Writing XS in plain C}\\
+    \href{https://www.youtube.com/watch?v=haj_oYoxYkg}{Ref::Util - more than you ever wanted to know}\\
+    \href{https://github.com/dur-randir/yapc-eu-2018}{https://github.com/dur-randir/yapc-eu-2018}
+}
+\end{frame}
+
+
+} % BGW
+}\end{document}
